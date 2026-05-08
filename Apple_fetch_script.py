@@ -1,3 +1,28 @@
+"""
+APPLE TERAFORT US — APP STORE CONNECT SYNC (v3)
+================================================
+
+CHANGES FROM v2:
+  - get_all_apps() now captures bundleId, sku, primaryLocale (was only id+name)
+  - NEW function fetch_app_status() — gets app_store_state per app
+  - NEW table apps_dim — stores Apple app metadata + status
+  - NO changes to app_master_v2 (will be done in a separate script later)
+
+WHAT GETS POPULATED IN apps_dim:
+  apple_id          — Numeric ID
+  app_name          — Display name
+  bundle_id         — com.example.app (NEW — was missing before)
+  sku               — Internal SKU
+  primary_locale    — e.g. "en-US"
+  app_store_state   — Latest version state (READY_FOR_DISTRIBUTION, REJECTED, etc.)
+  version_string    — Latest version number (e.g. "1.2.3")
+
+DEFENSIVE BEHAVIOR:
+  - If status API call fails for an app, that app's status is logged as NULL
+  - Bundle_id capture is independent — works even if status calls fail
+  - Rate limited (0.15s between status calls)
+"""
+
 import os, re, json, gzip, time, io, csv, logging, requests
 from datetime import datetime, timedelta, date
 from dateutil.relativedelta import relativedelta
@@ -14,12 +39,15 @@ APPLE_ISSUER_ID      = os.environ["APPLE_ISSUER_ID"].strip()
 APPLE_PRIVATE_KEY    = os.environ["APPLE_PRIVATE_KEY"].strip().replace("\\n", "\n")
 APPLE_VENDOR_NUMBER  = os.environ["APPLE_VENDOR_NUMBER"].strip()
 GCP_PROJECT          = os.environ["GCP_PROJECT"].strip()
-BQ_DATASET           = os.environ.get("BQ_DATASET", "apple_store_data_terafort_us")
+BQ_DATASET           = os.environ.get("BQ_DATASET", "apple_console_terafort_us")
 GCP_CREDENTIALS_JSON = os.environ["GCP_CREDENTIALS_JSON"]
 SALES_LOOKBACK_DAYS     = int(os.environ.get("SALES_LOOKBACK_DAYS", "7"))
 FINANCE_LOOKBACK_MONTHS = int(os.environ.get("FINANCE_LOOKBACK_MONTHS", "3"))
 
 BASE_URL = "https://api.appstoreconnect.apple.com/v1"
+
+# Rate limit safety for status API calls
+STATUS_API_DELAY_SEC = 0.15  # Apple ASC limit is 50 req/sec — 0.15s gives ~6 req/sec
 
 # ─── JWT AUTH ─────────────────────────────────────────────────────────────────
 _token_cache = {"token": None, "expires_at": 0}
@@ -84,7 +112,7 @@ def get_sales_date_range():
 S = bigquery.SchemaField
 SCHEMAS = {
     "sales_daily": [
-        S("date","DATE"),  # report date — the date we fetched this report for
+        S("date","DATE"),
         S("provider","STRING"), S("provider_country","STRING"), S("sku","STRING"),
         S("developer","STRING"), S("title","STRING"), S("version","STRING"),
         S("product_type_id","STRING"), S("units","FLOAT"), S("developer_proceeds","FLOAT"),
@@ -100,7 +128,6 @@ SCHEMAS = {
         S("_ingested_at","TIMESTAMP"),
     ],
     "subscription_daily": [
-        # FIX v2: Added date column — was missing, impossible to dedup without it
         S("date","DATE"),
         S("app_name","STRING"), S("app_apple_id","STRING"),
         S("subscription_name","STRING"), S("subscription_apple_id","STRING"),
@@ -229,10 +256,23 @@ SCHEMAS = {
         S("source_type","STRING"), S("territory","STRING"),
         S("device","STRING"), S("_ingested_at","TIMESTAMP"),
     ],
+
+    # ════════════════════════════════════════════════════════════════════════
+    # NEW IN v3: apps_dim — Apple app metadata bridge to package_name/bundle_id
+    # ════════════════════════════════════════════════════════════════════════
+    "apps_dim": [
+        S("apple_id",        "STRING"),    # Numeric Apple ID (e.g. "1523282975")
+        S("app_name",        "STRING"),    # Display name
+        S("bundle_id",       "STRING"),    # com.example.app format (NEW)
+        S("sku",             "STRING"),    # Internal SKU
+        S("primary_locale",  "STRING"),    # e.g. "en-US"
+        S("app_store_state", "STRING"),    # READY_FOR_DISTRIBUTION / REJECTED / etc.
+        S("version_string",  "STRING"),    # Latest version number (e.g. "1.2.3")
+        S("_ingested_at",    "TIMESTAMP"),
+    ],
 }
 
 ANALYTICS_REPORT_MAP = {
-    # Confirmed from Apple API log — exact substring matches against report names
     "App Sessions Standard":                       "analytics_sessions",
     "App Store Installation and Deletion Standard": "analytics_installs",
     "App Crashes":                                  "analytics_crashes",
@@ -244,19 +284,15 @@ ANALYTICS_REPORT_MAP = {
     "App Store Pre-Orders Standard":                "analytics_app_store_preorders",
 }
 
-# Tables with a "date" column — delete by date range before insert
 DATE_TABLES = {
-    "sales_daily",
-    "subscription_daily",
-    "subscription_event_daily",
-    "subscriber_daily",
-    "analytics_sessions", "analytics_installs", "analytics_crashes",
-    "analytics_app_store_discovery", "analytics_app_store_downloads",
-    "analytics_app_store_purchases", "analytics_subscription_state",
-    "analytics_app_store_web_preview", "analytics_app_store_preorders",
+    "sales_daily", "subscription_daily", "subscription_event_daily",
+    "subscriber_daily", "analytics_sessions", "analytics_installs",
+    "analytics_crashes", "analytics_app_store_discovery",
+    "analytics_app_store_downloads", "analytics_app_store_purchases",
+    "analytics_subscription_state", "analytics_app_store_web_preview",
+    "analytics_app_store_preorders",
 }
 
-# Date column name per table
 DATE_COL = {
     "sales_daily":                      "begins_period",
     "subscription_daily":               "date",
@@ -304,7 +340,7 @@ def fetch_sales_daily():
     while current <= end:
         for r in get_sales_report("SALES", "SUMMARY", "DAILY", current.strftime("%Y-%m-%d")):
             rows.append({
-                "date":               current.strftime("%Y-%m-%d"),  # report date
+                "date": current.strftime("%Y-%m-%d"),
                 "provider": r.get("Provider"),
                 "provider_country": r.get("Provider Country"),
                 "sku": r.get("SKU"), "developer": r.get("Developer"),
@@ -344,7 +380,6 @@ def fetch_subscription_daily():
     while current <= end:
         for r in get_sales_report("SUBSCRIPTION", "SUMMARY", "DAILY", current.strftime("%Y-%m-%d")):
             rows.append({
-                # FIX v2: date field added — was missing in v1
                 "date": str(current),
                 "app_name": r.get("App Name"), "app_apple_id": r.get("App Apple ID"),
                 "subscription_name": r.get("Subscription Name"),
@@ -491,7 +526,17 @@ def fetch_finance_monthly():
     return rows
 
 # ─── ANALYTICS ────────────────────────────────────────────────────────────────
+
+# ════════════════════════════════════════════════════════════════════════════
+# CHANGED IN v3: Captures bundleId, sku, primaryLocale (was only id+name)
+# ════════════════════════════════════════════════════════════════════════════
 def get_all_apps():
+    """
+    Fetch all apps from Apple's /v1/apps endpoint.
+
+    v3 CHANGE: Now captures bundleId, sku, and primaryLocale from the
+               attributes object. These are needed for apps_dim table.
+    """
     apps, url = [], f"{BASE_URL}/apps"
     params = {"limit": 200}
     while url:
@@ -499,7 +544,14 @@ def get_all_apps():
             resp = requests.get(url, params=params, headers=auth(), timeout=60)
             data = resp.json()
             for a in data.get("data", []):
-                apps.append({"id": a["id"], "name": a["attributes"].get("name", "")})
+                attrs = a.get("attributes", {}) or {}
+                apps.append({
+                    "id":             a["id"],
+                    "name":           attrs.get("name", ""),
+                    "bundle_id":      attrs.get("bundleId"),       # NEW v3
+                    "sku":            attrs.get("sku"),            # NEW v3
+                    "primary_locale": attrs.get("primaryLocale"),  # NEW v3
+                })
             url = data.get("links", {}).get("next")
             params = {}
         except Exception as e:
@@ -507,6 +559,124 @@ def get_all_apps():
             break
     log.info(f"  Found {len(apps)} apps")
     return apps
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# NEW IN v3: Fetch app store state (live/rejected/in_review/etc.)
+# ════════════════════════════════════════════════════════════════════════════
+def fetch_app_status(app_id):
+    """
+    Get the current App Store version state for one app.
+    Returns dict with app_store_state and version_string, or None on failure.
+
+    Endpoint: /v1/apps/{id}/appStoreVersions
+    Strategy: get the LATEST (most recent) version's state.
+
+    Possible states (Apple's documented values):
+      - PREPARE_FOR_SUBMISSION   (Draft / Prepare for Submission)
+      - WAITING_FOR_REVIEW       (Waiting for Review)
+      - IN_REVIEW                (In Review)
+      - PENDING_CONTRACT         (Pending Contract)
+      - WAITING_FOR_EXPORT_COMPLIANCE
+      - PENDING_DEVELOPER_RELEASE
+      - PROCESSING_FOR_APP_STORE
+      - PENDING_APPLE_RELEASE
+      - READY_FOR_DISTRIBUTION   (Live / Approved)
+      - READY_FOR_REVIEW
+      - REPLACED_WITH_NEW_VERSION
+      - REJECTED                 (Rejected by Apple)
+      - METADATA_REJECTED
+      - REMOVED_FROM_SALE
+      - DEVELOPER_REJECTED       (You rejected before submitting)
+      - DEVELOPER_REMOVED_FROM_SALE
+      - INVALID_BINARY
+
+    Defensive: any error returns None — never breaks the parent function.
+    """
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/apps/{app_id}/appStoreVersions",
+            params={
+                "limit": 5,
+                "sort": "-createdDate",  # newest first
+                "fields[appStoreVersions]": "appStoreState,versionString,createdDate",
+            },
+            headers=auth(),
+            timeout=30
+        )
+
+        if resp.status_code != 200:
+            log.warning(f"    Status fetch failed app={app_id}: HTTP {resp.status_code}")
+            return None
+
+        data = resp.json().get("data", [])
+        if not data:
+            return None
+
+        # Take the first (most recent) version
+        latest = data[0]
+        attrs = latest.get("attributes", {}) or {}
+        return {
+            "app_store_state": attrs.get("appStoreState"),
+            "version_string":  attrs.get("versionString"),
+        }
+
+    except Exception as e:
+        log.warning(f"    Status fetch exception app={app_id}: {e}")
+        return None
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# NEW IN v3: Build apps_dim rows from /v1/apps + /appStoreVersions
+# ════════════════════════════════════════════════════════════════════════════
+def build_apps_dim_rows(apps):
+    """
+    Build apps_dim rows.
+    For each app:
+      1. Use bundle_id, sku, primary_locale from /v1/apps (already fetched)
+      2. Call /appStoreVersions for app_store_state and version_string
+    """
+    log.info(f"Building apps_dim rows ({len(apps)} apps, fetching status for each)...")
+    ts = now_ts()
+    rows = []
+    status_success = 0
+    status_failure = 0
+
+    for i, app in enumerate(apps, start=1):
+        if not app.get("id"):
+            continue
+
+        # Fetch status (defensive — never breaks if API fails)
+        status_info = fetch_app_status(app["id"])
+        if status_info:
+            status_success += 1
+        else:
+            status_failure += 1
+
+        rows.append({
+            "apple_id":        str(app["id"]),
+            "app_name":        app.get("name") or None,
+            "bundle_id":       app.get("bundle_id") or None,
+            "sku":             app.get("sku") or None,
+            "primary_locale":  app.get("primary_locale") or None,
+            "app_store_state": (status_info or {}).get("app_store_state"),
+            "version_string":  (status_info or {}).get("version_string"),
+            "_ingested_at":    ts,
+        })
+
+        # Rate limit (Apple ASC: 50 req/sec — 0.15s sleep = ~6 req/sec, safe)
+        time.sleep(STATUS_API_DELAY_SEC)
+
+        if i % 25 == 0:
+            log.info(f"  Apps processed: {i}/{len(apps)}")
+
+    log.info(
+        f"  ✓ apps_dim: {len(rows)} rows  "
+        f"(bundle_id: {sum(1 for r in rows if r['bundle_id'])}, "
+        f"status_ok: {status_success}, status_fail: {status_failure})"
+    )
+    return rows
+
 
 def ensure_analytics_request(app_id):
     try:
@@ -714,14 +884,12 @@ def fetch_all_analytics(apps):
 
 # ─── BIGQUERY ─────────────────────────────────────────────────────────────────
 def dedup_rows(rows, key_fields):
-    """Deduplicate rows by key fields — keeps last occurrence."""
     seen = {}
     for r in rows:
         key = tuple(r.get(f) for f in key_fields)
         seen[key] = r
     return list(seen.values())
 
-# Key fields for deduplicating each analytics table
 ANALYTICS_DEDUP_KEYS = {
     "analytics_sessions":              ["date", "app_id", "app_version", "device", "platform_version", "source_type", "page_type", "territory"],
     "analytics_installs":              ["date", "app_id", "event", "download_type", "app_version", "device", "platform_version", "source_type", "page_type", "territory"],
@@ -754,25 +922,16 @@ def ensure_table(bq, name):
         bq.create_table(bigquery.Table(ref, schema=SCHEMAS[name]))
 
 def load_to_bq(bq, name, rows, delete_filter=None):
-    """
-    FIX v2: Batch load jobs — no streaming buffer.
-    delete_filter: SQL WHERE clause string for clearing existing data.
-    """
     if not rows:
         log.info(f"  No rows for {name}")
         return
-
     table_ref = f"{GCP_PROJECT}.{BQ_DATASET}.{name}"
-
-    # Step 1: Delete existing data
     if delete_filter:
         try:
             bq.query(f"DELETE FROM `{table_ref}` WHERE {delete_filter}").result()
             log.info(f"  Cleared {name} ({delete_filter})")
         except Exception as e:
             log.warning(f"  Could not clear {name}: {e}")
-
-    # Step 2: Batch load job
     try:
         job_config = bigquery.LoadJobConfig(
             schema=SCHEMAS[name],
@@ -786,7 +945,7 @@ def load_to_bq(bq, name, rows, delete_filter=None):
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
-    log.info("🍎 Apple App Store Connect → BigQuery v2 (14 tables)")
+    log.info("🍎 Apple App Store Connect → BigQuery v3 (15 tables, +apps_dim)")
     log.info(f"   Sales lookback:   {SALES_LOOKBACK_DAYS} days")
     log.info(f"   Finance lookback: {FINANCE_LOOKBACK_MONTHS} months")
 
@@ -796,7 +955,7 @@ def main():
         ensure_table(bq, t)
 
     start, end = get_sales_date_range()
-    sales_filter = f"date BETWEEN '{start}' AND '{end}'"  # report date column
+    sales_filter = f"date BETWEEN '{start}' AND '{end}'"
     sub_filter   = f"date BETWEEN '{start}' AND '{end}'"
     evt_filter   = f"event_date BETWEEN '{start}' AND '{end}'"
 
@@ -808,7 +967,6 @@ def main():
 
     log.info("── Finance Reports ──")
     finance_rows = fetch_finance_monthly()
-    # FIX v2: Delete by each report_month before loading — no duplicate months
     today = date.today()
     for i in range(1, FINANCE_LOOKBACK_MONTHS + 1):
         report_month = (today - relativedelta(months=i)).strftime("%Y-%m")
@@ -820,20 +978,27 @@ def main():
             log.info(f"  Cleared finance_monthly for {report_month}")
         except Exception as e:
             log.warning(f"  Could not clear finance_monthly {report_month}: {e}")
-    # Load all finance rows in one batch
-    load_to_bq(bq, "finance_monthly", finance_rows)  # no delete_filter — already cleared above
+    load_to_bq(bq, "finance_monthly", finance_rows)
 
-    log.info("── Analytics Reports ──")
+    # ════════════════════════════════════════════════════════════════════════
+    # NEW IN v3: Fetch apps + write apps_dim BEFORE analytics
+    # ════════════════════════════════════════════════════════════════════════
+    log.info("── Apps + apps_dim (NEW v3) ──")
     apps = get_all_apps()
     if apps:
+        # Build apps_dim with bundle_id, sku, locale, status
+        apps_dim_rows = build_apps_dim_rows(apps)
+        # Truncate apps_dim every run (full refresh — small table)
+        load_to_bq(bq, "apps_dim", apps_dim_rows, delete_filter="TRUE")
+
+        # ── Analytics (unchanged) ──
+        log.info("── Analytics Reports ──")
         analytics = fetch_all_analytics(apps)
         for table_name, rows in analytics.items():
             if not rows:
                 log.info(f"  No rows for {table_name}")
                 continue
-            # FIX v2: Delete date range found in fetched data before loading
             dates = [r.get("date") for r in rows if r.get("date")]
-            # Deduplicate rows before loading — Apple can return duplicate segments
             key_fields = ANALYTICS_DEDUP_KEYS.get(table_name)
             if key_fields:
                 before = len(rows)
@@ -847,9 +1012,9 @@ def main():
             else:
                 load_to_bq(bq, table_name, rows)
     else:
-        log.warning("  No apps found — skipping analytics")
+        log.warning("  No apps found — skipping apps_dim and analytics")
 
-    log.info("✅ Apple App Store Connect sync v2 complete! 14 tables.")
+    log.info("✅ Apple App Store Connect sync v3 complete! 15 tables (+apps_dim).")
 
 if __name__ == "__main__":
     main()
