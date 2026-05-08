@@ -1,12 +1,18 @@
 """
-APPLE TERAFORT US — APP STORE CONNECT SYNC (v3)
-================================================
+APPLE TERAFORT US — APP STORE CONNECT SYNC (v3.1)
+==================================================
+
+CHANGES FROM v3:
+  - fetch_app_status(): removed fields[] filter (Apple was returning HTTP 400)
+  - fetch_app_status(): removed sort param (sort client-side)
+  - fetch_app_status(): tries multiple field names for state
+  - fetch_app_status(): logs Apple's actual error message
 
 CHANGES FROM v2:
   - get_all_apps() now captures bundleId, sku, primaryLocale (was only id+name)
   - NEW function fetch_app_status() — gets app_store_state per app
   - NEW table apps_dim — stores Apple app metadata + status
-  - NO changes to app_master_v2 (will be done in a separate script later)
+  - NO changes to app_master_v2 (separate concern)
 
 WHAT GETS POPULATED IN apps_dim:
   apple_id          — Numeric ID
@@ -570,55 +576,78 @@ def fetch_app_status(app_id):
     Returns dict with app_store_state and version_string, or None on failure.
 
     Endpoint: /v1/apps/{id}/appStoreVersions
-    Strategy: get the LATEST (most recent) version's state.
+    Strategy: get versions, sort client-side by createdDate, take latest.
+
+    v3.1 CHANGES from v3:
+      - Removed fields[] filter (was returning HTTP 400)
+      - Removed sort param (sort client-side)
+      - Tries multiple possible field names for state
+      - Logs Apple's actual error message on failure (debug)
 
     Possible states (Apple's documented values):
       - PREPARE_FOR_SUBMISSION   (Draft / Prepare for Submission)
       - WAITING_FOR_REVIEW       (Waiting for Review)
       - IN_REVIEW                (In Review)
-      - PENDING_CONTRACT         (Pending Contract)
-      - WAITING_FOR_EXPORT_COMPLIANCE
-      - PENDING_DEVELOPER_RELEASE
-      - PROCESSING_FOR_APP_STORE
-      - PENDING_APPLE_RELEASE
       - READY_FOR_DISTRIBUTION   (Live / Approved)
-      - READY_FOR_REVIEW
-      - REPLACED_WITH_NEW_VERSION
       - REJECTED                 (Rejected by Apple)
       - METADATA_REJECTED
       - REMOVED_FROM_SALE
       - DEVELOPER_REJECTED       (You rejected before submitting)
-      - DEVELOPER_REMOVED_FROM_SALE
       - INVALID_BINARY
+      - And others
 
     Defensive: any error returns None — never breaks the parent function.
     """
     try:
         resp = requests.get(
             f"{BASE_URL}/apps/{app_id}/appStoreVersions",
-            params={
-                "limit": 5,
-                "sort": "-createdDate",  # newest first
-                "fields[appStoreVersions]": "appStoreState,versionString,createdDate",
-            },
+            params={"limit": 10},  # MINIMAL params — Apple rejected fields[] filter
             headers=auth(),
             timeout=30
         )
 
         if resp.status_code != 200:
-            log.warning(f"    Status fetch failed app={app_id}: HTTP {resp.status_code}")
+            # Log Apple's actual error message so we know what's wrong
+            try:
+                err = resp.json()
+                err_msg = err.get("errors", [{}])[0].get("detail", str(err))[:200]
+            except:
+                err_msg = resp.text[:200]
+            log.warning(f"    Status fetch failed app={app_id}: HTTP {resp.status_code} — {err_msg}")
             return None
 
         data = resp.json().get("data", [])
         if not data:
             return None
 
-        # Take the first (most recent) version
+        # Sort by createdDate DESC client-side (newest first)
+        try:
+            data.sort(
+                key=lambda v: v.get("attributes", {}).get("createdDate", ""),
+                reverse=True
+            )
+        except:
+            pass
+
+        # Take the latest version
         latest = data[0]
         attrs = latest.get("attributes", {}) or {}
+
+        # Try multiple possible field names — Apple's API has used different names
+        state = (
+            attrs.get("appStoreState")        # standard ASC API
+            or attrs.get("state")             # newer API version
+            or attrs.get("appVersionState")   # alternative name
+        )
+
+        version = (
+            attrs.get("versionString")
+            or attrs.get("version")
+        )
+
         return {
-            "app_store_state": attrs.get("appStoreState"),
-            "version_string":  attrs.get("versionString"),
+            "app_store_state": state,
+            "version_string":  version,
         }
 
     except Exception as e:
@@ -945,7 +974,7 @@ def load_to_bq(bq, name, rows, delete_filter=None):
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
-    log.info("🍎 Apple App Store Connect → BigQuery v3 (15 tables, +apps_dim)")
+    log.info("🍎 Apple App Store Connect → BigQuery v3.1 (15 tables, +apps_dim)")
     log.info(f"   Sales lookback:   {SALES_LOOKBACK_DAYS} days")
     log.info(f"   Finance lookback: {FINANCE_LOOKBACK_MONTHS} months")
 
@@ -1014,7 +1043,7 @@ def main():
     else:
         log.warning("  No apps found — skipping apps_dim and analytics")
 
-    log.info("✅ Apple App Store Connect sync v3 complete! 15 tables (+apps_dim).")
+    log.info("✅ Apple App Store Connect sync v3.1 complete! 15 tables (+apps_dim).")
 
 if __name__ == "__main__":
     main()
