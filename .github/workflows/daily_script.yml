@@ -8,11 +8,11 @@ on:
       sales_lookback_days:
         description: "Days of sales history to fetch"
         required: false
-        default: "7"
+        default: "21"
       finance_lookback_months:
         description: "Months of finance history to fetch"
         required: false
-        default: "3"
+        default: "6"
 
 jobs:
   sync:
