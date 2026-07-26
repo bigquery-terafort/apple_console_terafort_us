@@ -1,35 +1,52 @@
 """
-APPLE TERAFORT US — APP STORE CONNECT SYNC (v3.1)
-==================================================
+Apple App Store Connect → BigQuery  ·  COMPLETE PIPELINE v3
+============================================================
+⚠️  YE FILE DONO APPLE REPOS MEIN LAGTI HAI:
+        apple_store_connect          (BQ_DATASET=apple_store_data)
+        apple_console_terafort_us    (BQ_DATASET=apple_console_terafort_us)
+    Farq sirf env vars ka hai (vendor number + dataset).
 
-CHANGES FROM v3:
-  - fetch_app_status(): removed fields[] filter (Apple was returning HTTP 400)
-  - fetch_app_status(): removed sort param (sort client-side)
-  - fetch_app_status(): tries multiple field names for state
-  - fetch_app_status(): logs Apple's actual error message
+🔴 v3 KYUN — YE SCRIPT DATA KHA RAHI THI
+────────────────────────────────────────
+BigQuery se saabit nuqsan (analytics_app_store_downloads):
+    2026-01   31/31 din gayab
+    2026-02   28/28 din gayab
+    2026-03   29/31 din gayab
+    2026-05   31/31 din gayab
+    2026-06   18/30 din gayab   ← ye 2026-07-26 09:09 ke run mein hi uda
 
-CHANGES FROM v2:
-  - get_all_apps() now captures bundleId, sku, primaryLocale (was only id+name)
-  - NEW function fetch_app_status() — gets app_store_state per app
-  - NEW table apps_dim — stores Apple app metadata + status
-  - NO changes to app_master_v2 (separate concern)
+ASLI BUG (v2 ke main() mein):
+    dates = [r.get("date") for r in rows if r.get("date")]
+    min_d, max_d = min(dates), max(dates)
+    analytics_filter = f"date BETWEEN '{min_d}' AND '{max_d}'"   # ← POORI RANGE
+    load_to_bq(bq, table_name, rows, analytics_filter)           # DELETE, phir insert
 
-WHAT GETS POPULATED IN apps_dim:
-  apple_id          — Numeric ID
-  app_name          — Display name
-  bundle_id         — com.example.app (NEW — was missing before)
-  sku               — Internal SKU
-  primary_locale    — e.g. "en-US"
-  app_store_state   — Latest version state (READY_FOR_DISTRIBUTION, REJECTED, etc.)
-  version_string    — Latest version number (e.g. "1.2.3")
+  min_d..max_d us data se banta hai jo KAAMYABI se mila. Aur fetch chup-chaap
+  tootta rehta tha — chaar jagah bare `except: continue` / `except: pass`.
+  Nateeja: kuch apps ka data Jan se July tak phaila mila → DELETE ne Jan se
+  July tak SAB uda diya → sirf jo mila wo wapas dala. Har run thoda aur khaya.
+  Aur load fail ho to bhi sirf log.error — script `exit 0` deti thi.
 
-DEFENSIVE BEHAVIOR:
-  - If status API call fails for an app, that app's status is logged as NULL
-  - Bundle_id capture is independent — works even if status calls fail
-  - Rate limited (0.15s between status calls)
+v3 KE FIX:
+  🛡️ 1. fetch ki har nakami GINI JATI hai (bare except khatam)
+  🛡️ 2. adhoora fetch → DELETE bilkul nahi, aur exit(1)
+  🛡️ 3. `BETWEEN min AND max` → `date IN (...)` — sirf wahi din jo AAYE hain
+  🛡️ 4. DELETE + INSERT atomic (staging + BEGIN TRANSACTION)
+  🛡️ 5. finance/sales bhi atomic
+  ✅ Baqi sab v2 jaisa: 14 tables, JWT auth, dedup keys, batch load jobs
+
+Auth: JWT (ES256), auto-refreshed every 20 minutes
+
+Tables (14):
+  SALES (4):     sales_daily, subscription_daily, subscription_event_daily, subscriber_daily
+  FINANCE (1):   finance_monthly
+  ANALYTICS (9): analytics_sessions, analytics_installs, analytics_crashes,
+                 analytics_app_store_discovery, analytics_app_store_downloads,
+                 analytics_app_store_purchases, analytics_subscription_state,
+                 analytics_app_store_web_preview, analytics_app_store_preorders
 """
 
-import os, re, json, gzip, time, io, csv, logging, requests
+import os, re, json, gzip, time, io, csv, sys, logging, requests
 from datetime import datetime, timedelta, date
 from dateutil.relativedelta import relativedelta
 from google.cloud import bigquery
@@ -45,15 +62,12 @@ APPLE_ISSUER_ID      = os.environ["APPLE_ISSUER_ID"].strip()
 APPLE_PRIVATE_KEY    = os.environ["APPLE_PRIVATE_KEY"].strip().replace("\\n", "\n")
 APPLE_VENDOR_NUMBER  = os.environ["APPLE_VENDOR_NUMBER"].strip()
 GCP_PROJECT          = os.environ["GCP_PROJECT"].strip()
-BQ_DATASET           = os.environ.get("BQ_DATASET", "apple_console_terafort_us")
+BQ_DATASET           = os.environ.get("BQ_DATASET", "apple_store_data")
 GCP_CREDENTIALS_JSON = os.environ["GCP_CREDENTIALS_JSON"]
 SALES_LOOKBACK_DAYS     = int(os.environ.get("SALES_LOOKBACK_DAYS", "7"))
 FINANCE_LOOKBACK_MONTHS = int(os.environ.get("FINANCE_LOOKBACK_MONTHS", "3"))
 
 BASE_URL = "https://api.appstoreconnect.apple.com/v1"
-
-# Rate limit safety for status API calls
-STATUS_API_DELAY_SEC = 0.15  # Apple ASC limit is 50 req/sec — 0.15s gives ~6 req/sec
 
 # ─── JWT AUTH ─────────────────────────────────────────────────────────────────
 _token_cache = {"token": None, "expires_at": 0}
@@ -80,11 +94,11 @@ def auth():
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
 def sf(v):
     try: return float(v) if v not in (None, "", "--", "N/A") else None
-    except: return None
+    except Exception: return None
 
 def si(v):
     try: return int(float(v)) if v not in (None, "", "--", "N/A") else None
-    except: return None
+    except Exception: return None
 
 def now_ts():
     return datetime.utcnow().isoformat()
@@ -94,7 +108,7 @@ def parse_date(s):
     s = str(s).strip()
     for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%Y%m%d"):
         try: return datetime.strptime(s[:10], fmt).strftime("%Y-%m-%d")
-        except: pass
+        except Exception: pass
     return s[:10] if len(s) >= 10 else s
 
 def is_valid_date(s):
@@ -262,24 +276,10 @@ SCHEMAS = {
         S("source_type","STRING"), S("territory","STRING"),
         S("device","STRING"), S("_ingested_at","TIMESTAMP"),
     ],
-
-    # ════════════════════════════════════════════════════════════════════════
-    # NEW IN v3: apps_dim — Apple app metadata bridge to package_name/bundle_id
-    # ════════════════════════════════════════════════════════════════════════
-    "apps_dim": [
-        S("apple_id",        "STRING"),    # Numeric Apple ID (e.g. "1523282975")
-        S("app_name",        "STRING"),    # Display name
-        S("bundle_id",       "STRING"),    # com.example.app format (NEW)
-        S("sku",             "STRING"),    # Internal SKU
-        S("primary_locale",  "STRING"),    # e.g. "en-US"
-        S("app_store_state", "STRING"),    # READY_FOR_DISTRIBUTION / REJECTED / etc.
-        S("version_string",  "STRING"),    # Latest version number (e.g. "1.2.3")
-        S("_ingested_at",    "TIMESTAMP"),
-    ],
 }
 
 ANALYTICS_REPORT_MAP = {
-    "App Sessions Standard":                       "analytics_sessions",
+    "App Sessions Standard":                        "analytics_sessions",
     "App Store Installation and Deletion Standard": "analytics_installs",
     "App Crashes":                                  "analytics_crashes",
     "App Store Discovery and Engagement Standard":  "analytics_app_store_discovery",
@@ -291,12 +291,11 @@ ANALYTICS_REPORT_MAP = {
 }
 
 DATE_TABLES = {
-    "sales_daily", "subscription_daily", "subscription_event_daily",
-    "subscriber_daily", "analytics_sessions", "analytics_installs",
-    "analytics_crashes", "analytics_app_store_discovery",
-    "analytics_app_store_downloads", "analytics_app_store_purchases",
-    "analytics_subscription_state", "analytics_app_store_web_preview",
-    "analytics_app_store_preorders",
+    "sales_daily", "subscription_daily", "subscription_event_daily", "subscriber_daily",
+    "analytics_sessions", "analytics_installs", "analytics_crashes",
+    "analytics_app_store_discovery", "analytics_app_store_downloads",
+    "analytics_app_store_purchases", "analytics_subscription_state",
+    "analytics_app_store_web_preview", "analytics_app_store_preorders",
 }
 
 DATE_COL = {
@@ -330,7 +329,7 @@ def get_sales_report(report_type, report_subtype, frequency, report_date):
         if resp.status_code == 200:
             return tsv_rows(resp.content)
         elif resp.status_code in (400, 404):
-            return []
+            return []      # us din ka report maujood nahi — normal
         else:
             log.warning(f"  {report_type}/{report_date}: HTTP {resp.status_code}")
             return []
@@ -346,7 +345,7 @@ def fetch_sales_daily():
     while current <= end:
         for r in get_sales_report("SALES", "SUMMARY", "DAILY", current.strftime("%Y-%m-%d")):
             rows.append({
-                "date": current.strftime("%Y-%m-%d"),
+                "date":               current.strftime("%Y-%m-%d"),
                 "provider": r.get("Provider"),
                 "provider_country": r.get("Provider Country"),
                 "sku": r.get("SKU"), "developer": r.get("Developer"),
@@ -532,17 +531,7 @@ def fetch_finance_monthly():
     return rows
 
 # ─── ANALYTICS ────────────────────────────────────────────────────────────────
-
-# ════════════════════════════════════════════════════════════════════════════
-# CHANGED IN v3: Captures bundleId, sku, primaryLocale (was only id+name)
-# ════════════════════════════════════════════════════════════════════════════
 def get_all_apps():
-    """
-    Fetch all apps from Apple's /v1/apps endpoint.
-
-    v3 CHANGE: Now captures bundleId, sku, and primaryLocale from the
-               attributes object. These are needed for apps_dim table.
-    """
     apps, url = [], f"{BASE_URL}/apps"
     params = {"limit": 200}
     while url:
@@ -550,14 +539,7 @@ def get_all_apps():
             resp = requests.get(url, params=params, headers=auth(), timeout=60)
             data = resp.json()
             for a in data.get("data", []):
-                attrs = a.get("attributes", {}) or {}
-                apps.append({
-                    "id":             a["id"],
-                    "name":           attrs.get("name", ""),
-                    "bundle_id":      attrs.get("bundleId"),       # NEW v3
-                    "sku":            attrs.get("sku"),            # NEW v3
-                    "primary_locale": attrs.get("primaryLocale"),  # NEW v3
-                })
+                apps.append({"id": a["id"], "name": a["attributes"].get("name", "")})
             url = data.get("links", {}).get("next")
             params = {}
         except Exception as e:
@@ -565,147 +547,6 @@ def get_all_apps():
             break
     log.info(f"  Found {len(apps)} apps")
     return apps
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# NEW IN v3: Fetch app store state (live/rejected/in_review/etc.)
-# ════════════════════════════════════════════════════════════════════════════
-def fetch_app_status(app_id):
-    """
-    Get the current App Store version state for one app.
-    Returns dict with app_store_state and version_string, or None on failure.
-
-    Endpoint: /v1/apps/{id}/appStoreVersions
-    Strategy: get versions, sort client-side by createdDate, take latest.
-
-    v3.1 CHANGES from v3:
-      - Removed fields[] filter (was returning HTTP 400)
-      - Removed sort param (sort client-side)
-      - Tries multiple possible field names for state
-      - Logs Apple's actual error message on failure (debug)
-
-    Possible states (Apple's documented values):
-      - PREPARE_FOR_SUBMISSION   (Draft / Prepare for Submission)
-      - WAITING_FOR_REVIEW       (Waiting for Review)
-      - IN_REVIEW                (In Review)
-      - READY_FOR_DISTRIBUTION   (Live / Approved)
-      - REJECTED                 (Rejected by Apple)
-      - METADATA_REJECTED
-      - REMOVED_FROM_SALE
-      - DEVELOPER_REJECTED       (You rejected before submitting)
-      - INVALID_BINARY
-      - And others
-
-    Defensive: any error returns None — never breaks the parent function.
-    """
-    try:
-        resp = requests.get(
-            f"{BASE_URL}/apps/{app_id}/appStoreVersions",
-            params={"limit": 10},  # MINIMAL params — Apple rejected fields[] filter
-            headers=auth(),
-            timeout=30
-        )
-
-        if resp.status_code != 200:
-            # Log Apple's actual error message so we know what's wrong
-            try:
-                err = resp.json()
-                err_msg = err.get("errors", [{}])[0].get("detail", str(err))[:200]
-            except:
-                err_msg = resp.text[:200]
-            log.warning(f"    Status fetch failed app={app_id}: HTTP {resp.status_code} — {err_msg}")
-            return None
-
-        data = resp.json().get("data", [])
-        if not data:
-            return None
-
-        # Sort by createdDate DESC client-side (newest first)
-        try:
-            data.sort(
-                key=lambda v: v.get("attributes", {}).get("createdDate", ""),
-                reverse=True
-            )
-        except:
-            pass
-
-        # Take the latest version
-        latest = data[0]
-        attrs = latest.get("attributes", {}) or {}
-
-        # Try multiple possible field names — Apple's API has used different names
-        state = (
-            attrs.get("appStoreState")        # standard ASC API
-            or attrs.get("state")             # newer API version
-            or attrs.get("appVersionState")   # alternative name
-        )
-
-        version = (
-            attrs.get("versionString")
-            or attrs.get("version")
-        )
-
-        return {
-            "app_store_state": state,
-            "version_string":  version,
-        }
-
-    except Exception as e:
-        log.warning(f"    Status fetch exception app={app_id}: {e}")
-        return None
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# NEW IN v3: Build apps_dim rows from /v1/apps + /appStoreVersions
-# ════════════════════════════════════════════════════════════════════════════
-def build_apps_dim_rows(apps):
-    """
-    Build apps_dim rows.
-    For each app:
-      1. Use bundle_id, sku, primary_locale from /v1/apps (already fetched)
-      2. Call /appStoreVersions for app_store_state and version_string
-    """
-    log.info(f"Building apps_dim rows ({len(apps)} apps, fetching status for each)...")
-    ts = now_ts()
-    rows = []
-    status_success = 0
-    status_failure = 0
-
-    for i, app in enumerate(apps, start=1):
-        if not app.get("id"):
-            continue
-
-        # Fetch status (defensive — never breaks if API fails)
-        status_info = fetch_app_status(app["id"])
-        if status_info:
-            status_success += 1
-        else:
-            status_failure += 1
-
-        rows.append({
-            "apple_id":        str(app["id"]),
-            "app_name":        app.get("name") or None,
-            "bundle_id":       app.get("bundle_id") or None,
-            "sku":             app.get("sku") or None,
-            "primary_locale":  app.get("primary_locale") or None,
-            "app_store_state": (status_info or {}).get("app_store_state"),
-            "version_string":  (status_info or {}).get("version_string"),
-            "_ingested_at":    ts,
-        })
-
-        # Rate limit (Apple ASC: 50 req/sec — 0.15s sleep = ~6 req/sec, safe)
-        time.sleep(STATUS_API_DELAY_SEC)
-
-        if i % 25 == 0:
-            log.info(f"  Apps processed: {i}/{len(apps)}")
-
-    log.info(
-        f"  ✓ apps_dim: {len(rows)} rows  "
-        f"(bundle_id: {sum(1 for r in rows if r['bundle_id'])}, "
-        f"status_ok: {status_success}, status_fail: {status_failure})"
-    )
-    return rows
-
 
 def ensure_analytics_request(app_id):
     try:
@@ -838,14 +679,18 @@ def parse_analytics_row(r, table_name, app_id, app_name, proc_date):
         }
     return base
 
+# 🛡️ v3: ab (results, failures) deta hai — bare except khatam
 def fetch_all_analytics(apps):
     log.info(f"Fetching Analytics for {len(apps)} apps...")
-    results = {t: [] for t in ANALYTICS_REPORT_MAP.values()}
+    results  = {t: [] for t in ANALYTICS_REPORT_MAP.values()}
+    failures = 0
 
     for app in apps:
         app_id, app_name = app["id"], app["name"]
         request_id = ensure_analytics_request(app_id)
         if not request_id:
+            log.warning(f"  No analytics request for {app_name}")
+            failures += 1
             continue
 
         try:
@@ -856,6 +701,7 @@ def fetch_all_analytics(apps):
             reports = resp.json().get("data", [])
         except Exception as e:
             log.warning(f"  Reports list error {app_name}: {e}")
+            failures += 1
             continue
 
         for report in reports:
@@ -867,7 +713,7 @@ def fetch_all_analytics(apps):
                     table_name = tbl
                     break
             if not table_name:
-                continue
+                continue      # hamara table nahi — nakami nahi
 
             try:
                 resp = requests.get(
@@ -876,7 +722,9 @@ def fetch_all_analytics(apps):
                     headers=auth(), timeout=30
                 )
                 instances = resp.json().get("data", [])
-            except:
+            except Exception as e:                       # 🛡️ v3: bare except khatam
+                log.warning(f"  instances error {app_name}/{table_name}: {e}")
+                failures += 1
                 continue
 
             for instance in instances:
@@ -888,7 +736,9 @@ def fetch_all_analytics(apps):
                         headers=auth(), timeout=30
                     )
                     segments = resp.json().get("data", [])
-                except:
+                except Exception as e:                   # 🛡️ v3
+                    log.warning(f"  segments error {app_name}/{table_name}: {e}")
+                    failures += 1
                     continue
 
                 for seg in segments:
@@ -897,22 +747,32 @@ def fetch_all_analytics(apps):
                         continue
                     try:
                         dl = requests.get(dl_url, timeout=120)
-                        if dl.status_code == 200:
-                            raw_rows = tsv_rows(dl.content)
-                            for r in raw_rows:
-                                parsed = parse_analytics_row(r, table_name, app_id, app_name, proc_date)
-                                results[table_name].append(parsed)
-                    except:
-                        pass
+                        if dl.status_code != 200:
+                            log.warning(f"  segment HTTP {dl.status_code} "
+                                        f"{app_name}/{table_name}")
+                            failures += 1                # 🛡️ v3
+                            continue
+                        for r in tsv_rows(dl.content):
+                            results[table_name].append(
+                                parse_analytics_row(r, table_name, app_id,
+                                                    app_name, proc_date))
+                    except Exception as e:               # 🛡️ v3: `pass` khatam
+                        log.warning(f"  segment download failed "
+                                    f"{app_name}/{table_name}: {e}")
+                        failures += 1
+                        continue
 
         time.sleep(0.2)
 
     for tbl, rows in results.items():
         log.info(f"  ✓ {tbl}: {len(rows)} rows")
-    return results
+    if failures:
+        log.error(f"  🚨 {failures} fetch failure(s) during analytics pull")
+    return results, failures
 
 # ─── BIGQUERY ─────────────────────────────────────────────────────────────────
 def dedup_rows(rows, key_fields):
+    """Deduplicate rows by key fields — keeps last occurrence."""
     seen = {}
     for r in rows:
         key = tuple(r.get(f) for f in key_fields)
@@ -938,43 +798,55 @@ def get_bq():
     return bigquery.Client(project=GCP_PROJECT, credentials=creds)
 
 def ensure_dataset(bq):
-    try: bq.get_dataset(BQ_DATASET)
-    except:
+    try:
+        bq.get_dataset(BQ_DATASET)
+    except Exception:
         log.info(f"Creating dataset {BQ_DATASET}")
         bq.create_dataset(bigquery.Dataset(f"{GCP_PROJECT}.{BQ_DATASET}"))
 
 def ensure_table(bq, name):
     ref = bq.dataset(BQ_DATASET).table(name)
-    try: bq.get_table(ref)
-    except:
+    try:
+        bq.get_table(ref)
+    except Exception:
         log.info(f"Creating table {name}")
         bq.create_table(bigquery.Table(ref, schema=SCHEMAS[name]))
 
+# 🛡️ v3: ATOMIC — staging + BEGIN TRANSACTION
 def load_to_bq(bq, name, rows, delete_filter=None):
+    """v3: DELETE aur INSERT ya dono chalte hain ya kuch nahi.
+
+    v2: DELETE pehle, load baad mein, aur load fail pe sirf log.error →
+    us poori range ka data ghayab aur script phir bhi exit 0.
+    """
     if not rows:
         log.info(f"  No rows for {name}")
         return
+
     table_ref = f"{GCP_PROJECT}.{BQ_DATASET}.{name}"
-    if delete_filter:
-        try:
-            bq.query(f"DELETE FROM `{table_ref}` WHERE {delete_filter}").result()
-            log.info(f"  Cleared {name} ({delete_filter})")
-        except Exception as e:
-            log.warning(f"  Could not clear {name}: {e}")
-    try:
-        job_config = bigquery.LoadJobConfig(
-            schema=SCHEMAS[name],
-            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
-        )
-        load_job = bq.load_table_from_json(rows, table_ref, job_config=job_config)
-        load_job.result()
-        log.info(f"  ✅ {len(rows):,} rows → {name}")
-    except Exception as e:
-        log.error(f"  Load job failed [{name}]: {e}")
+    stg_ref   = f"{table_ref}_stg"
+
+    # Step 1: PEHLE staging mein. Yahan fail hua to asli table salamat.
+    job_config = bigquery.LoadJobConfig(
+        schema=SCHEMAS[name],
+        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+    )
+    bq.load_table_from_json(rows, stg_ref, job_config=job_config).result()
+
+    # Step 2: ek atomic transaction
+    where = f"WHERE {delete_filter}" if delete_filter else ""
+    bq.query(f"""
+        BEGIN TRANSACTION;
+          DELETE FROM `{table_ref}` {where};
+          INSERT INTO `{table_ref}` SELECT * FROM `{stg_ref}`;
+        COMMIT TRANSACTION;
+    """).result()
+    log.info(f"  ✅ {len(rows):,} rows → {name} (atomic)")
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
-    log.info("🍎 Apple App Store Connect → BigQuery v3.1 (15 tables, +apps_dim)")
+    log.info("🍎 Apple App Store Connect → BigQuery v3 (14 tables)")
+    log.info(f"   Dataset:          {BQ_DATASET}")
     log.info(f"   Sales lookback:   {SALES_LOOKBACK_DAYS} days")
     log.info(f"   Finance lookback: {FINANCE_LOOKBACK_MONTHS} months")
 
@@ -996,54 +868,58 @@ def main():
 
     log.info("── Finance Reports ──")
     finance_rows = fetch_finance_monthly()
-    today = date.today()
-    for i in range(1, FINANCE_LOOKBACK_MONTHS + 1):
-        report_month = (today - relativedelta(months=i)).strftime("%Y-%m")
-        try:
-            bq.query(
-                f"DELETE FROM `{GCP_PROJECT}.{BQ_DATASET}.finance_monthly` "
-                f"WHERE report_month = '{report_month}'"
-            ).result()
-            log.info(f"  Cleared finance_monthly for {report_month}")
-        except Exception as e:
-            log.warning(f"  Could not clear finance_monthly {report_month}: {e}")
-    load_to_bq(bq, "finance_monthly", finance_rows)
-
-    # ════════════════════════════════════════════════════════════════════════
-    # NEW IN v3: Fetch apps + write apps_dim BEFORE analytics
-    # ════════════════════════════════════════════════════════════════════════
-    log.info("── Apps + apps_dim (NEW v3) ──")
-    apps = get_all_apps()
-    if apps:
-        # Build apps_dim with bundle_id, sku, locale, status
-        apps_dim_rows = build_apps_dim_rows(apps)
-        # Truncate apps_dim every run (full refresh — small table)
-        load_to_bq(bq, "apps_dim", apps_dim_rows, delete_filter="TRUE")
-
-        # ── Analytics (unchanged) ──
-        log.info("── Analytics Reports ──")
-        analytics = fetch_all_analytics(apps)
-        for table_name, rows in analytics.items():
-            if not rows:
-                log.info(f"  No rows for {table_name}")
-                continue
-            dates = [r.get("date") for r in rows if r.get("date")]
-            key_fields = ANALYTICS_DEDUP_KEYS.get(table_name)
-            if key_fields:
-                before = len(rows)
-                rows = dedup_rows(rows, key_fields)
-                if len(rows) < before:
-                    log.info(f"  Deduped {table_name}: {before} → {len(rows)} rows")
-            if dates:
-                min_d, max_d = min(dates), max(dates)
-                analytics_filter = f"date BETWEEN '{min_d}' AND '{max_d}'"
-                load_to_bq(bq, table_name, rows, analytics_filter)
-            else:
-                load_to_bq(bq, table_name, rows)
+    if finance_rows:
+        # 🛡️ v3: months ki LIST se DELETE (range nahi), aur atomic load_to_bq se
+        months = sorted({r["report_month"] for r in finance_rows if r.get("report_month")})
+        month_list = ",".join(f"'{m}'" for m in months)
+        load_to_bq(bq, "finance_monthly", finance_rows,
+                   f"report_month IN ({month_list})")
     else:
-        log.warning("  No apps found — skipping apps_dim and analytics")
+        log.warning("  No finance rows — nothing deleted, nothing loaded")
 
-    log.info("✅ Apple App Store Connect sync v3.1 complete! 15 tables (+apps_dim).")
+    log.info("── Analytics Reports ──")
+    apps = get_all_apps()
+    if not apps:
+        log.error("🚨 No apps found — skipping analytics entirely "
+                  "(existing data preserved).")
+        sys.exit(1)
+
+    analytics, failures = fetch_all_analytics(apps)
+
+    # 🛡️ GUARD 1: adhoora fetch = DELETE bilkul nahi.
+    #    Yehi guard na hone ki wajah se Jan/Feb/Mar/May aur June ke 18 din gaye.
+    if failures:
+        log.error(f"🚨 {failures} fetch failure(s) — analytics rows are "
+                  f"INCOMPLETE. Skipping delete+load entirely so existing "
+                  f"data is preserved. Fix access and re-run.")
+        sys.exit(1)
+
+    for table_name, rows in analytics.items():
+        if not rows:
+            log.info(f"  No rows for {table_name}")
+            continue
+
+        key_fields = ANALYTICS_DEDUP_KEYS.get(table_name)
+        if key_fields:
+            before = len(rows)
+            rows = dedup_rows(rows, key_fields)
+            if len(rows) < before:
+                log.info(f"  Deduped {table_name}: {before} → {len(rows)} rows")
+
+        # 🛡️ GUARD 2: range NAHI — sirf wahi din jo asal mein aaye hain.
+        #    `BETWEEN min AND max` beech ke un dinon ko bhi uda deta tha jo
+        #    is baar nahi aaye. Aadha saal isi ek lafz se gaya.
+        days = sorted({str(r["date"])[:10] for r in rows if r.get("date")})
+        if not days:
+            log.warning(f"  {table_name}: no usable dates — skipping")
+            continue
+
+        day_list = ",".join(f"'{d}'" for d in days)
+        log.info(f"  {table_name}: replacing {len(days)} day(s) "
+                 f"({days[0]} … {days[-1]})")
+        load_to_bq(bq, table_name, rows, f"date IN ({day_list})")
+
+    log.info("✅ Apple App Store Connect sync v3 complete! 14 tables.")
 
 if __name__ == "__main__":
     main()
