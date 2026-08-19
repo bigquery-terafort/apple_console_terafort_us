@@ -1,23 +1,57 @@
+# =============================================================================
+#  Apple App Store Connect → BigQuery Sync   ·  TERAFORT US        (v2.0)
+#  repo: apple_console_terafort_us (ya jo bhi naam ho)
+#  path: .github/workflows/<jo naam hai>.yml
+# =============================================================================
+#  ⚠️ SPARTANS WALI YAML SE FARQ — SIRF DO:
+#       1. script ka naam:  Apple_fetch_script.py   (spartans par apple_to_bigquery.py)
+#       2. BQ_DATASET:      secrets se (spartans par vars se)
+#
+#  v1.0 SE KYA BADLA:
+#   1. 🔴 KEEPALIVE JOB — GitHub 60 din tak commit na ho to scheduled
+#      workflow CHUP-CHAAP band kar deta hai. Hamare saath AdMob-4 par
+#      ho chuka hai (2 din ka data gum). Koi third-party action NAHI —
+#      org policy blocks karti hai, is liye seedha git.
+#   2. permissions: contents: write  (keepalive ke commit ke liye)
+#   3. 🆕 apps_dim health check — chup-chaap fail nahi hogi
+#   4. timeout + concurrency guard
+#   5. requirements.txt na ho to bhi chalega
+#
+#  🔑 SAB SE AHEM: is repo par bhi apple_to_bigquery_v4.py lagani hai
+#     (Apple_fetch_script.py ke naam se). v3 mein apps_dim ka code hai
+#     hi nahi — isi liye terafort_us ki apps_dim 26 JULY se atki hui hai.
+#
+#  ⚠️ v4 chalane se PEHLE purani table DROP karein (schema alag hai):
+#       DROP TABLE `terafort.apple_console_terafort_us.apps_dim`;
+# =============================================================================
 name: Apple App Store Connect → BigQuery Sync
 
 on:
   schedule:
-    - cron: "0 7 * * *" # 7:00 AM UTC daily
+    - cron: "0 7 * * *"          # 07:00 UTC = 12:00 PKT
   workflow_dispatch:
     inputs:
       sales_lookback_days:
-        description: "Days of sales history to fetch"
+        description: "Sales ke kitne din kheenchein"
         required: false
         default: "21"
       finance_lookback_months:
-        description: "Months of finance history to fetch"
+        description: "Finance ke kitne mahine"
         required: false
         default: "6"
+
+permissions:
+  contents: write                # 🔧 keepalive ke liye
+
+concurrency:
+  group: apple-sync-terafort-us
+  cancel-in-progress: false
 
 jobs:
   sync:
     name: Sync Apple App Store Connect Data to BigQuery
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
@@ -30,17 +64,99 @@ jobs:
           cache: "pip"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install requests pyjwt cryptography google-cloud-bigquery
+          fi
 
       - name: Run Apple to BigQuery sync
         env:
-          APPLE_KEY_ID: ${{ secrets.APPLE_KEY_ID }}
-          APPLE_ISSUER_ID: ${{ secrets.APPLE_ISSUER_ID }}
-          APPLE_PRIVATE_KEY: ${{ secrets.APPLE_PRIVATE_KEY }}
-          APPLE_VENDOR_NUMBER: ${{ secrets.APPLE_VENDOR_NUMBER }}
-          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
-          GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
-          BQ_DATASET: ${{ secrets.BQ_DATASET }}
-          SALES_LOOKBACK_DAYS: ${{ github.event.inputs.sales_lookback_days || '7' }}
+          APPLE_KEY_ID:            ${{ secrets.APPLE_KEY_ID }}
+          APPLE_ISSUER_ID:         ${{ secrets.APPLE_ISSUER_ID }}
+          APPLE_PRIVATE_KEY:       ${{ secrets.APPLE_PRIVATE_KEY }}
+          APPLE_VENDOR_NUMBER:     ${{ secrets.APPLE_VENDOR_NUMBER }}
+          GCP_PROJECT:             ${{ secrets.GCP_PROJECT }}
+          GCP_CREDENTIALS_JSON:    ${{ secrets.GCP_CREDENTIALS_JSON }}
+          BQ_DATASET:              ${{ secrets.BQ_DATASET }}
+          SALES_LOOKBACK_DAYS:     ${{ github.event.inputs.sales_lookback_days || '7' }}
           FINANCE_LOOKBACK_MONTHS: ${{ github.event.inputs.finance_lookback_months || '3' }}
         run: python Apple_fetch_script.py
+
+      # 🆕 apps_dim bani ya nahi — chup-chaap fail na ho
+      - name: Health check
+        if: always()
+        env:
+          GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
+          GCP_PROJECT:          ${{ secrets.GCP_PROJECT }}
+          BQ_DATASET:           ${{ secrets.BQ_DATASET }}
+        run: |
+          echo "$GCP_CREDENTIALS_JSON" > /tmp/gcp.json
+          export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp.json
+          python - <<'EOF'
+          import os
+          from google.cloud import bigquery
+          bq = bigquery.Client(project=os.environ["GCP_PROJECT"])
+          ds = f'{os.environ["GCP_PROJECT"]}.{os.environ["BQ_DATASET"]}'
+          print(f"\n── {ds} " + "─"*30)
+
+          for t in ["apps_dim", "sales_daily", "finance_monthly",
+                    "analytics_installs", "analytics_sessions"]:
+              try:
+                  n = list(bq.query(f"SELECT COUNT(*) n FROM `{ds}.{t}`").result())[0].n
+                  print(f"   ✅ {t:<24} {n:>9,} rows")
+              except Exception:
+                  mark = "🔴" if t == "apps_dim" else "⚠️ "
+                  print(f"   {mark} {t:<24} table nahi mili")
+
+          # 🔑 apps_dim ka bundle coverage — yehi asal maqsad hai
+          try:
+              q = f"""SELECT COUNT(*) apps,
+                             COUNTIF(bundle_id IS NOT NULL AND TRIM(bundle_id)!='') bundles
+                      FROM `{ds}.apps_dim`"""
+              r = list(bq.query(q).result())[0]
+              print(f"\n   🔑 apps_dim: {r.apps} apps · bundle_id bhara {r.bundles}/{r.apps}")
+              if r.bundles == 0:
+                  print("      ⚠️  bundle_id kisi par nahi — API key ka ROLE check karein")
+          except Exception as e:
+              print(f"\n   🔴 apps_dim NAHI BANI — {type(e).__name__}")
+              print("      → v4 script lagi hai? (v3 mein apps_dim ka code nahi hai)")
+              print("      → purani table DROP ki? schema alag hai:")
+              print(f"        DROP TABLE `{ds}.apps_dim`;")
+          EOF
+
+  # ═══════════════════════════════════════════════════════════════════════
+  #  🔴 KEEPALIVE — 60-din wala auto-disable rokta hai
+  # ═══════════════════════════════════════════════════════════════════════
+  keepalive:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Keepalive commit (sirf agar 45 din se koi commit nahi)
+        run: |
+          set -euo pipefail
+          LAST=$(git log -1 --format=%ct)
+          NOW=$(date +%s)
+          DAYS=$(( (NOW - LAST) / 86400 ))
+          echo "aakhri commit ko $DAYS din huye"
+
+          if [ "$DAYS" -lt 45 ]; then
+            echo "✅ 45 din se kam — commit ki zaroorat nahi"
+            exit 0
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .keepalive
+          git add .keepalive
+          git commit -m "chore(keepalive): workflow ko zinda rakhne ke liye [skip ci]"
+          git push
+          echo "✅ keepalive commit ho gaya — agle 60 din mehfooz"
