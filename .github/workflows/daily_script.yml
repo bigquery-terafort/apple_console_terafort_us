@@ -1,28 +1,46 @@
 # =============================================================================
-#  Apple App Store Connect → BigQuery Sync   ·  TERAFORT US        (v2.0)
-#  repo: apple_console_terafort_us (ya jo bhi naam ho)
-#  path: .github/workflows/<jo naam hai>.yml
+#  Apple App Store Connect → BigQuery Sync                          (v3.0)
+#  repo: bigquery-terafort/apple_console_terafort_us
+#  path: .github/workflows/daily_script.yml
 # =============================================================================
-#  ⚠️ SPARTANS WALI YAML SE FARQ — SIRF DO:
-#       1. script ka naam:  Apple_fetch_script.py   (spartans par apple_to_bigquery.py)
-#       2. BQ_DATASET:      secrets se (spartans par vars se)
+#  ⚠️  YE FILE apple_store_connect WALI SE THORI ALAG HAI:
+#        BQ_DATASET ka default = apple_console_terafort_us  (wahan apple_store_data)
+#      Baqi sab bilkul same.
 #
-#  v1.0 SE KYA BADLA:
-#   1. 🔴 KEEPALIVE JOB — GitHub 60 din tak commit na ho to scheduled
-#      workflow CHUP-CHAAP band kar deta hai. Hamare saath AdMob-4 par
-#      ho chuka hai (2 din ka data gum). Koi third-party action NAHI —
-#      org policy blocks karti hai, is liye seedha git.
-#   2. permissions: contents: write  (keepalive ke commit ke liye)
-#   3. 🆕 apps_dim health check — chup-chaap fail nahi hogi
-#   4. timeout + concurrency guard
-#   5. requirements.txt na ho to bhi chalega
+#  🔴 RUN #159 KA BUG — HEALTH CHECK JHOOT BOL RAHA THA
+#  ────────────────────────────────────────────────────
+#      Sync ne 2,570,750 rows load kiye (verified in BigQuery), phir
+#      health check ne har table par "table nahi mili" likha.
 #
-#  🔑 SAB SE AHEM: is repo par bhi apple_to_bigquery_v4.py lagani hai
-#     (Apple_fetch_script.py ke naam se). v3 mein apps_dim ka code hai
-#     hi nahi — isi liye terafort_us ki apps_dim 26 JULY se atki hui hai.
+#      WAJAH: GCP_PROJECT secret mein trailing space hai.
+#        #182 (chalta hua) :  ── ***.***  ──
+#        #159 (toota hua)  :  ── *** .*** ──   ← space
 #
-#  ⚠️ v4 chalane se PEHLE purani table DROP karein (schema alag hai):
-#       DROP TABLE `terafort.apple_console_terafort_us.apps_dim`;
+#      Python script bach jati hai kyunke wo strip karti hai:
+#          GCP_PROJECT = os.environ["GCP_PROJECT"].strip()
+#      Health check strip NAHI karta tha → `terafort .dataset.table`
+#      → BadRequest (400), NotFound (404) nahi. Isi liye HAR table
+#      ek jaisi fail hui.
+#
+#  v3.0 KE FIX:
+#   1. 🔴 health check ab har env var .strip() karta hai
+#   2. 🔴 BQ_DATASET ka default is repo ke liye sahi kiya
+#         (pehle 'apple_store_data' tha — agar vars.BQ_DATASET kabhi
+#          unset hua to ye repo DOOSRE vendor ke dataset mein likhti,
+#          aur v3 script ki `date IN (...)` DELETE unki rows mita deti)
+#   3. 🔴 TIMEOUT 60 → 150 min (v4 script retries lagati hai, waqt lagta hai)
+#   4. 🆕 retry knobs env se: HTTP_RETRIES / HTTP_BACKOFF / SEGMENT_TIMEOUT
+#   5. 🆕 _stg tables ki safai — har run ke baad copy chhod dete the
+#   6. 🆕 health check mein freshness (sirf row count nahi)
+#
+#  ⚠️  EXIT CODE 1 KA MATLAB BADAL GAYA (v4 script):
+#        v3: 1 = kuch load nahi hua (poora run zaya)
+#        v4: 1 = kuch app/table chhoot gaye, BAQI SAB LOAD HO GAYA
+#      Red X ab data-loss NAHI hai.
+#
+#  SECRETS: APPLE_KEY_ID · APPLE_ISSUER_ID · APPLE_PRIVATE_KEY ·
+#           APPLE_VENDOR_NUMBER · GCP_PROJECT · GCP_CREDENTIALS_JSON
+#  VARS:    BQ_DATASET = apple_console_terafort_us
 # =============================================================================
 name: Apple App Store Connect → BigQuery Sync
 
@@ -33,32 +51,34 @@ on:
     inputs:
       sales_lookback_days:
         description: "Sales ke kitne din kheenchein"
-        required: false
         default: "21"
       finance_lookback_months:
         description: "Finance ke kitne mahine"
-        required: false
         default: "6"
+      http_retries:
+        description: "Har HTTP call par kitni retries (default 3)"
+        default: "3"
+      segment_timeout:
+        description: "S3 segment download timeout, seconds (default 300)"
+        default: "300"
 
 permissions:
-  contents: write                # 🔧 keepalive ke liye
+  contents: write                # keepalive commit ke liye
 
 concurrency:
-  group: apple-sync-terafort-us
+  group: apple-sync-console-us
   cancel-in-progress: false
 
 jobs:
   sync:
     name: Sync Apple App Store Connect Data to BigQuery
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 150
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
@@ -69,10 +89,10 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install requests pyjwt cryptography google-cloud-bigquery
+            pip install requests pyjwt cryptography google-cloud-bigquery python-dateutil
           fi
 
-      - name: Run Apple to BigQuery sync
+      - name: Run sync
         env:
           APPLE_KEY_ID:            ${{ secrets.APPLE_KEY_ID }}
           APPLE_ISSUER_ID:         ${{ secrets.APPLE_ISSUER_ID }}
@@ -80,55 +100,117 @@ jobs:
           APPLE_VENDOR_NUMBER:     ${{ secrets.APPLE_VENDOR_NUMBER }}
           GCP_PROJECT:             ${{ secrets.GCP_PROJECT }}
           GCP_CREDENTIALS_JSON:    ${{ secrets.GCP_CREDENTIALS_JSON }}
-          BQ_DATASET:              ${{ secrets.BQ_DATASET }}
+          # 🔴 default is repo ke liye — DOOSRE vendor ka dataset nahi
+          BQ_DATASET:              ${{ vars.BQ_DATASET || 'apple_console_terafort_us' }}
           SALES_LOOKBACK_DAYS:     ${{ github.event.inputs.sales_lookback_days || '7' }}
           FINANCE_LOOKBACK_MONTHS: ${{ github.event.inputs.finance_lookback_months || '3' }}
-        run: python Apple_fetch_script.py
+          HTTP_RETRIES:            ${{ github.event.inputs.http_retries || '3' }}
+          HTTP_BACKOFF:            '5'
+          SEGMENT_TIMEOUT:         ${{ github.event.inputs.segment_timeout || '300' }}
+          API_TIMEOUT:             '60'
+        run: python apple_to_bigquery.py
 
-      # 🆕 apps_dim bani ya nahi — chup-chaap fail na ho
-      - name: Health check
+      # 🧹 staging tables ki safai — har run ke baad poori copy chhod dete the.
+      #    analytics_app_store_discovery_stg akela ~2.5M rows ka tha.
+      - name: Clean staging tables
         if: always()
         env:
           GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
           GCP_PROJECT:          ${{ secrets.GCP_PROJECT }}
-          BQ_DATASET:           ${{ secrets.BQ_DATASET }}
+          BQ_DATASET:           ${{ vars.BQ_DATASET || 'apple_console_terafort_us' }}
         run: |
           echo "$GCP_CREDENTIALS_JSON" > /tmp/gcp.json
           export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp.json
           python - <<'EOF'
           import os
           from google.cloud import bigquery
-          bq = bigquery.Client(project=os.environ["GCP_PROJECT"])
-          ds = f'{os.environ["GCP_PROJECT"]}.{os.environ["BQ_DATASET"]}'
-          print(f"\n── {ds} " + "─"*30)
+          project = os.environ["GCP_PROJECT"].strip()
+          dataset = os.environ["BQ_DATASET"].strip()
+          bq = bigquery.Client(project=project)
+          dropped = 0
+          for t in bq.list_tables(f"{project}.{dataset}"):
+              if t.table_id.endswith("_stg"):
+                  bq.delete_table(f"{project}.{dataset}.{t.table_id}", not_found_ok=True)
+                  print(f"   dropped {t.table_id}")
+                  dropped += 1
+          print(f"   {dropped} staging table(s) cleaned")
+          EOF
 
-          for t in ["apps_dim", "sales_daily", "finance_monthly",
-                    "analytics_installs", "analytics_sessions"]:
+      # Health check — 🔴 v3: .strip() har env var par (run #159 ka bug)
+      - name: Health check
+        if: always()
+        env:
+          GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
+          GCP_PROJECT:          ${{ secrets.GCP_PROJECT }}
+          BQ_DATASET:           ${{ vars.BQ_DATASET || 'apple_console_terafort_us' }}
+        run: |
+          echo "$GCP_CREDENTIALS_JSON" > /tmp/gcp.json
+          export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp.json
+          python - <<'EOF'
+          import os
+          from google.cloud import bigquery
+
+          # 🔴 .strip() — run #159 mein GCP_PROJECT ke trailing space ki wajah se
+          #    `terafort .dataset.table` ban raha tha → BadRequest → har table
+          #    "nahi mili" dikh rahi thi jabke data maujood tha.
+          project = os.environ["GCP_PROJECT"].strip()
+          dataset = os.environ["BQ_DATASET"].strip()
+
+          bq = bigquery.Client(project=project)
+          ds = f"{project}.{dataset}"
+          print(f"\n-- {ds} " + "-"*40)
+
+          DATED = {
+              "sales_daily":                    "date",
+              "analytics_installs":             "date",
+              "analytics_sessions":             "date",
+              "analytics_app_store_downloads":  "date",
+              "analytics_app_store_discovery":  "date",
+          }
+
+          for t, col in DATED.items():
               try:
-                  n = list(bq.query(f"SELECT COUNT(*) n FROM `{ds}.{t}`").result())[0].n
-                  print(f"   ✅ {t:<24} {n:>9,} rows")
-              except Exception:
-                  mark = "🔴" if t == "apps_dim" else "⚠️ "
-                  print(f"   {mark} {t:<24} table nahi mili")
+                  r = list(bq.query(
+                      f"SELECT COUNT(*) n, CAST(MAX({col}) AS STRING) last_dt, "
+                      f"DATE_DIFF(CURRENT_DATE(), MAX({col}), DAY) stale "
+                      f"FROM `{ds}.{t}`").result())[0]
+                  mark = "OK  " if (r.stale is not None and r.stale <= 4) else "OLD "
+                  print(f"   [{mark}] {t:<32} {r.n:>10,} rows - last {r.last_dt} ({r.stale}d)")
+              except Exception as e:
+                  print(f"   [FAIL] {t:<32} {type(e).__name__}: {e}")
 
-          # 🔑 apps_dim ka bundle coverage — yehi asal maqsad hai
+          try:
+              r = list(bq.query(f"SELECT COUNT(*) n FROM `{ds}.finance_monthly`").result())[0]
+              print(f"   [OK  ] {'finance_monthly':<32} {r.n:>10,} rows")
+          except Exception as e:
+              print(f"   [FAIL] {'finance_monthly':<32} {type(e).__name__}: {e}")
+
+          # apps_dim ka bundle coverage — app_master_v2.ios_bundle_id ke liye lazmi
           try:
               q = f"""SELECT COUNT(*) apps,
-                             COUNTIF(bundle_id IS NOT NULL AND TRIM(bundle_id)!='') bundles
+                             COUNTIF(bundle_id IS NOT NULL AND TRIM(bundle_id)!='') bundles,
+                             CAST(MAX(_loaded_at) AS STRING) last_load
                       FROM `{ds}.apps_dim`"""
               r = list(bq.query(q).result())[0]
-              print(f"\n   🔑 apps_dim: {r.apps} apps · bundle_id bhara {r.bundles}/{r.apps}")
-              if r.bundles == 0:
-                  print("      ⚠️  bundle_id kisi par nahi — API key ka ROLE check karein")
+              print(f"\n   apps_dim: {r.apps} apps - bundle_id bhara {r.bundles}/{r.apps}")
+              print(f"   aakhri load: {r.last_load}")
+              if r.bundles < r.apps:
+                  print("   !! kuch apps par bundle_id khaali hai")
           except Exception as e:
-              print(f"\n   🔴 apps_dim NAHI BANI — {type(e).__name__}")
-              print("      → v4 script lagi hai? (v3 mein apps_dim ka code nahi hai)")
-              print("      → purani table DROP ki? schema alag hai:")
-              print(f"        DROP TABLE `{ds}.apps_dim`;")
+              print(f"\n   [FAIL] apps_dim -- {type(e).__name__}: {e}")
+              print("      -> BadRequest? GCP_PROJECT/BQ_DATASET secret mein")
+              print("         trailing space ya newline check karein.")
+              print("      -> NotFound? API key ka role check karein:")
+              print("         App Store Connect > Users and Access > Integrations")
+              print("         > Keys > role 'App Manager' ya 'Admin' hona chahiye")
+
+          print("\n   NOTE: v4 script mein exit code 1 ka matlab 'kuch app/table")
+          print("         chhoot gaye' hai -- 'kuch load nahi hua' NAHI.")
           EOF
 
   # ═══════════════════════════════════════════════════════════════════════
-  #  🔴 KEEPALIVE — 60-din wala auto-disable rokta hai
+  #  KEEPALIVE — 60-din wala auto-disable rokta hai
+  #     Koi third-party action nahi (org policy blocks) — seedha git.
   # ═══════════════════════════════════════════════════════════════════════
   keepalive:
     runs-on: ubuntu-latest
@@ -149,7 +231,7 @@ jobs:
           echo "aakhri commit ko $DAYS din huye"
 
           if [ "$DAYS" -lt 45 ]; then
-            echo "✅ 45 din se kam — commit ki zaroorat nahi"
+            echo "45 din se kam - commit ki zaroorat nahi"
             exit 0
           fi
 
@@ -159,4 +241,4 @@ jobs:
           git add .keepalive
           git commit -m "chore(keepalive): workflow ko zinda rakhne ke liye [skip ci]"
           git push
-          echo "✅ keepalive commit ho gaya — agle 60 din mehfooz"
+          echo "keepalive commit ho gaya - agle 60 din mehfooz"
