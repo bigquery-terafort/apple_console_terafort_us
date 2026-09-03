@@ -22,6 +22,14 @@
 #      → BadRequest (400), NotFound (404) nahi. Isi liye HAR table
 #      ek jaisi fail hui.
 #
+#  🔴 RUN #160 KE DO BUG
+#     a) python: can't open file '.../apple_to_bigquery.py'
+#        Script root pe nahi hai. -> Ab workflow use ANDAR ke marker
+#        ('ANALYTICS_REPORT_MAP') se dhoondhti hai, path se nahi.
+#     b) BQ_DATASET is repo mein SECRET hai, VARIABLE nahi.
+#        `vars.BQ_DATASET` hamesha khaali tha; sirf fallback default
+#        ki wajah se sahi dataset laga. -> Ab `secrets.BQ_DATASET`.
+#
 #  v3.0 KE FIX:
 #   1. 🔴 health check ab har env var .strip() karta hai
 #   2. 🔴 BQ_DATASET ka default is repo ke liye sahi kiya
@@ -101,14 +109,25 @@ jobs:
           GCP_PROJECT:             ${{ secrets.GCP_PROJECT }}
           GCP_CREDENTIALS_JSON:    ${{ secrets.GCP_CREDENTIALS_JSON }}
           # 🔴 default is repo ke liye — DOOSRE vendor ka dataset nahi
-          BQ_DATASET:              ${{ vars.BQ_DATASET || 'apple_console_terafort_us' }}
+          BQ_DATASET:              ${{ secrets.BQ_DATASET || 'apple_console_terafort_us' }}
           SALES_LOOKBACK_DAYS:     ${{ github.event.inputs.sales_lookback_days || '7' }}
           FINANCE_LOOKBACK_MONTHS: ${{ github.event.inputs.finance_lookback_months || '3' }}
           HTTP_RETRIES:            ${{ github.event.inputs.http_retries || '3' }}
           HTTP_BACKOFF:            '5'
           SEGMENT_TIMEOUT:         ${{ github.event.inputs.segment_timeout || '300' }}
           API_TIMEOUT:             '60'
-        run: python apple_to_bigquery.py
+        run: |
+          set -euo pipefail
+          # Script ko path se nahi, ANDAR ke marker se dhoondho. Run #160 mein
+          # 'apple_to_bigquery.py' root pe nahi mili thi.
+          SCRIPT=$(grep -rl 'ANALYTICS_REPORT_MAP' --include='*.py' . 2>/dev/null | head -1)
+          if [ -z "$SCRIPT" ]; then
+            echo "::error::Apple sync script nahi mili (koi .py mein ANALYTICS_REPORT_MAP nahi)"
+            find . -name '*.py' -not -path './.git/*' | head -20
+            exit 1
+          fi
+          echo "Using script: $SCRIPT"
+          python "$SCRIPT"
 
       # 🧹 staging tables ki safai — har run ke baad poori copy chhod dete the.
       #    analytics_app_store_discovery_stg akela ~2.5M rows ka tha.
@@ -117,7 +136,7 @@ jobs:
         env:
           GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
           GCP_PROJECT:          ${{ secrets.GCP_PROJECT }}
-          BQ_DATASET:           ${{ vars.BQ_DATASET || 'apple_console_terafort_us' }}
+          BQ_DATASET:           ${{ secrets.BQ_DATASET || 'apple_console_terafort_us' }}
         run: |
           echo "$GCP_CREDENTIALS_JSON" > /tmp/gcp.json
           export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp.json
@@ -142,7 +161,7 @@ jobs:
         env:
           GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
           GCP_PROJECT:          ${{ secrets.GCP_PROJECT }}
-          BQ_DATASET:           ${{ vars.BQ_DATASET || 'apple_console_terafort_us' }}
+          BQ_DATASET:           ${{ secrets.BQ_DATASET || 'apple_console_terafort_us' }}
         run: |
           echo "$GCP_CREDENTIALS_JSON" > /tmp/gcp.json
           export GOOGLE_APPLICATION_CREDENTIALS=/tmp/gcp.json
